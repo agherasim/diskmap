@@ -1,0 +1,245 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Disk Map</title>
+<style>
+:root{--bg:#1d1e21;--panel:#26282c;--line:#3a3d42;--fg:#e6e6e6;--mute:#9aa0a6;--sel:#34507a;--hover:#2d3035;--bar:#6c7cff;--link:#8ab4f8}
+*{box-sizing:border-box}html,body{height:100%;margin:0}
+body{background:var(--bg);color:var(--fg);font:12px/1.45 -apple-system,BlinkMacSystemFont,system-ui,sans-serif;
+  display:grid;grid-template-rows:auto minmax(0,36fr) minmax(0,64fr) auto}
+header{display:flex;flex-wrap:wrap;gap:4px 18px;align-items:baseline;padding:7px 12px;border-bottom:1px solid var(--line)}
+header h1{font-size:13px;margin:0;font-weight:600}
+header .meta{color:var(--mute)}
+#crumbs{flex-basis:100%;color:var(--mute)}#crumbs a{color:var(--link);cursor:pointer;text-decoration:none}#crumbs a:hover{text-decoration:underline}
+.top{display:grid;grid-template-columns:minmax(0,2fr) minmax(0,1fr);min-height:0;border-bottom:1px solid var(--line)}
+.pane{overflow:auto;min-height:0}.pane+.pane{border-left:1px solid var(--line)}
+table{border-collapse:collapse;width:100%}
+th{position:sticky;top:0;z-index:1;background:var(--panel);text-align:left;font-weight:600;padding:4px 8px;border-bottom:1px solid var(--line);white-space:nowrap}
+td{padding:1px 8px;white-space:nowrap;cursor:default}
+.num{text-align:right;font-variant-numeric:tabular-nums}
+td.name{max-width:420px;overflow:hidden;text-overflow:ellipsis}
+tr:hover td{background:var(--hover)}tr.sel td{background:var(--sel)}
+.tog{display:inline-block;width:14px;color:var(--mute);cursor:pointer;user-select:none}
+.bar{width:100px;height:9px;background:#34373c;border-radius:2px;overflow:hidden}.bar i{display:block;height:100%;background:var(--bar)}
+.extname{display:inline-block;max-width:120px;overflow:hidden;text-overflow:ellipsis;vertical-align:bottom}
+.sw{display:inline-block;width:24px;height:10px;border-radius:2px;vertical-align:-1px}
+.lump td.name{color:var(--mute);font-style:italic}
+#mapwrap{position:relative;min-height:0;background:#111}
+#mapwrap canvas{position:absolute;inset:0;width:100%;height:100%}
+#ov{cursor:crosshair}
+footer{padding:4px 12px;border-top:1px solid var(--line);color:var(--mute);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+#tip{position:fixed;pointer-events:none;background:#000d;border:1px solid #444;padding:4px 8px;border-radius:4px;display:none;max-width:60vw;z-index:9}
+#tip b{font-weight:600}
+@media (max-width:700px){.top{grid-template-columns:1fr}.pane+.pane{display:none}}
+</style></head><body>
+<header><h1 id="title"></h1><span class="meta" id="meta"></span><div id="crumbs"></div></header>
+<div class="top">
+  <div class="pane" id="treepane"><table><thead><tr><th>Name</th><th>Subtree %</th><th class="num">%</th><th class="num">Size</th><th class="num">Files</th></tr></thead><tbody id="tree"></tbody></table></div>
+  <div class="pane"><table><thead><tr><th>Extension</th><th>Color</th><th class="num">Size</th><th class="num">%</th><th class="num">Files</th></tr></thead><tbody id="exts"></tbody></table></div>
+</div>
+<div id="mapwrap"><canvas id="map"></canvas><canvas id="ov"></canvas></div>
+<footer id="status">Click a tile to select · double-click to zoom in · Esc to zoom out · click an extension to highlight it</footer>
+<div id="tip"></div>
+<script>
+const D = __DATA__;
+const $ = s => document.querySelector(s);
+const esc = s => s.replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const fmt = b => { const u=['B','KB','MB','GB','TB','PB']; let i=0; while (b>=1024 && i<u.length-1) { b/=1024; i++; } return (i ? b.toFixed(b<10?2:1) : b) + ' ' + u[i]; };
+const pct = (a, b) => b ? (100*a/b).toFixed(1) + '%' : '';
+
+// Colors: the biggest extensions get distinct hues, the rest are gray (like WinDirStat).
+// paletteer_c("ggthemes::Sunset-Sunrise Diverging", 30), Lab-interpolated like scales::gradient_n_pal
+const SUNSET = ['#33608C','#4D6291','#626496','#76669B','#8867A1','#9A68A4','#AC6A9F','#BD6C99','#CD6E94','#DD708E',
+  '#E87687','#EC867E','#F09574','#F3A469','#F5B35E','#F5B355','#F4A652','#F2994E','#F08B4B','#EE7D47',
+  '#EA7246','#E56946','#E06046','#DB5745','#D64E45','#D04544','#CA3B43','#C43142','#BE2641','#B81840'];
+// Neighbouring gradient steps are near-identical, so hand them out with a stride of 11
+// (coprime with 30): consecutive extension ranks get clearly different colours.
+const PALETTE = SUNSET.map((_, i) => SUNSET[(i * 11) % SUNSET.length]);
+const GRAY = '#5c6068', DIM = '#26282c';
+const mixCache = {};
+function mix(hex, to, amt) {
+  const k = hex + to + amt; if (mixCache[k]) return mixCache[k];
+  const a = parseInt(hex.slice(1), 16), b = parseInt(to.slice(1), 16);
+  const ch = s => Math.round(((a >> s) & 255) * (1 - amt) + ((b >> s) & 255) * amt).toString(16).padStart(2, '0');
+  return mixCache[k] = '#' + ch(16) + ch(8) + ch(0);
+}
+// Every extension gets a colour: ranks 1-30 use the palette, 31-60 a lighter and
+// 61-90 a darker variant of it, then the cycle repeats.
+const color = {}; let pi = 0;
+for (const [e] of D.exts) {
+  if (e === '*') continue;
+  const i = pi++, base = PALETTE[i % PALETTE.length], round = Math.floor(i / PALETTE.length) % 3;
+  color[e] = round === 0 ? base : mix(base, round === 1 ? '#ffffff' : '#000000', 0.32);
+}
+
+(function link(n, p) { n.p = p; if (n.c) for (const k of n.c) link(k, n); })(D.tree, null);
+
+// Lumped tiles ("<N small items>") have no extension of their own. Colour them by
+// the dominant extension (by bytes) of their folder so the map isn't mostly gray.
+(function dominant(n) {
+  const m = new Map(), add = (e, b) => m.set(e, (m.get(e) || 0) + b);
+  for (const c of n.c || []) {
+    if (c.c) for (const [e, b] of dominant(c)) add(e, b);
+    else if (c.e && c.e !== '*') add(c.e, c.s);
+  }
+  const top = [...m].sort((a, b) => b[1] - a[1]).slice(0, 8);  // bounded per folder
+  n.dom = top.length ? top[0][0] : null;
+  return top;
+})(D.tree);
+const domOf = n => { for (let a = n.p; a; a = a.p) if (a.dom) return a.dom; return null; };
+const isLump = n => n.e === '*';
+function tileColor(n) {
+  if (isLump(n)) { const d = domOf(n); return d && color[d] ? mix(color[d], '#111111', 0.22) : GRAY; }
+  if (isDir(n)) return n.dom && color[n.dom] ? color[n.dom] : GRAY;
+  return color[n.e] || GRAY;
+}
+const isDir = n => !!n.c;
+const pathOf = n => { const a = []; for (; n; n = n.p) a.push(n.n); return a.reverse().join('/').replace(/\/+/g, '/'); };
+const within = (n, anc) => { for (; n; n = n.p) if (n === anc) return true; return false; };
+
+let view = D.tree, sel = null, hiExt = null, leaves = [];
+const expanded = new Set([D.tree]);
+
+// ---------- header ----------
+$('#title').textContent = D.root;
+$('#meta').textContent = `${fmt(D.total)} · ${D.files.toLocaleString()} files · ${D.dirs.toLocaleString()} folders · ` +
+  `scanned ${D.scanned} in ${D.seconds}s` + (D.errors ? ` · ${D.errors.toLocaleString()} unreadable` : '');
+function renderCrumbs() {
+  const chain = []; for (let n = view; n; n = n.p) chain.unshift(n);
+  $('#crumbs').innerHTML = 'Treemap: ' + chain.map((n, i) => i === chain.length - 1
+    ? `<b>${esc(n.n)}</b>` : `<a data-i="${i}">${esc(n.n)}</a>`).join(' / ') + ` <span>(${fmt(view.s)})</span>`;
+  $('#crumbs').onclick = e => { const i = e.target.dataset.i; if (i != null) zoom(chain[+i]); };
+}
+
+// ---------- treemap (squarified) ----------
+const cv = $('#map'), ctx = cv.getContext('2d'), ov = $('#ov'), octx = ov.getContext('2d');
+function layout(node, x, y, w, h) {
+  node._r = [x, y, w, h];
+  const kids = node.c ? node.c.filter(k => k.s > 0) : [];
+  if (!kids.length) { if (w >= 0.5 && h >= 0.5) leaves.push(node); return; }
+  if (w < 1 || h < 1) { leaves.push(node); return; }
+  const scale = w * h / kids.reduce((a, k) => a + k.s, 0);
+  const a = kids.map(k => k.s * scale);
+  const worst = (sum, max, min, side) => Math.max(side*side*max/(sum*sum), sum*sum/(side*side*min));
+  let i = 0;
+  while (i < a.length) {
+    const side = Math.min(w, h);
+    let sum = a[i], j = i + 1, cur = worst(sum, a[i], a[i], side);
+    while (j < a.length) {
+      const r = worst(sum + a[j], a[i], a[j], side);
+      if (r > cur) break;
+      sum += a[j]; cur = r; j++;
+    }
+    if (w >= h) {
+      const cw = sum / h; let yy = y;
+      for (let k = i; k < j; k++) { const hh = a[k] / cw; layout(kids[k], x, yy, cw, hh); yy += hh; }
+      x += cw; w -= cw;
+    } else {
+      const rh = sum / w; let xx = x;
+      for (let k = i; k < j; k++) { const ww = a[k] / rh; layout(kids[k], xx, y, ww, rh); xx += ww; }
+      y += rh; h -= rh;
+    }
+    i = j;
+  }
+}
+function fit(c) {
+  const r = c.getBoundingClientRect(), dpr = window.devicePixelRatio || 1;
+  c.width = Math.round(r.width * dpr); c.height = Math.round(r.height * dpr);
+  c.getContext('2d').setTransform(dpr, 0, 0, dpr, 0, 0);
+  return r;
+}
+function draw() {
+  const r = fit(cv); fit(ov);
+  ctx.fillStyle = '#111'; ctx.fillRect(0, 0, r.width, r.height);
+  leaves = []; layout(view, 0, 0, r.width, r.height);
+  for (const n of leaves) {
+    const [x, y, w, h] = n._r;
+    let c = tileColor(n);
+    if (hiExt && n.e !== hiExt) c = DIM;
+    // flat fill; a 1px gap on tiles that can afford it keeps same-colored neighbours apart
+    ctx.fillStyle = c;
+    if (w < 4 || h < 4) ctx.fillRect(x, y, w, h); else ctx.fillRect(x, y, w - 1, h - 1);
+  }
+  drawOverlay(); renderCrumbs();
+}
+function drawOverlay(hover) {
+  const r = ov.getBoundingClientRect(); octx.clearRect(0, 0, r.width, r.height);
+  const box = (n, col, lw) => { if (!n || !n._r || !within(n, view)) return; const [x, y, w, h] = n._r;
+    octx.strokeStyle = col; octx.lineWidth = lw; octx.strokeRect(x + lw/2, y + lw/2, Math.max(w - lw, 1), Math.max(h - lw, 1)); };
+  box(hover, 'rgba(255,255,255,.55)', 1);
+  box(sel, '#fff', 2);
+}
+function hit(mx, my) {
+  for (const n of leaves) { const [x, y, w, h] = n._r; if (mx >= x && mx < x + w && my >= y && my < y + h) return n; }
+  return null;
+}
+const tip = $('#tip');
+ov.addEventListener('mousemove', e => {
+  const r = ov.getBoundingClientRect(), n = hit(e.clientX - r.left, e.clientY - r.top);
+  drawOverlay(n);
+  if (!n) { tip.style.display = 'none'; return; }
+  const kind = isLump(n) ? `<br><span style="color:#aaa">mixed small items · folder is mostly ${esc(domOf(n) || '?')}</span>` : '';
+  tip.innerHTML = `<b>${esc(n.n)}</b><br>${fmt(n.s)} · ${pct(n.s, D.total)} of total${kind}<br><span style="color:#aaa">${esc(pathOf(n.p))}</span>`;
+  tip.style.display = 'block';
+  const tx = Math.min(e.clientX + 14, innerWidth - tip.offsetWidth - 8), ty = Math.min(e.clientY + 14, innerHeight - tip.offsetHeight - 8);
+  tip.style.left = tx + 'px'; tip.style.top = ty + 'px';
+});
+ov.addEventListener('mouseleave', () => { tip.style.display = 'none'; drawOverlay(); });
+ov.addEventListener('click', e => { const r = ov.getBoundingClientRect(), n = hit(e.clientX - r.left, e.clientY - r.top); if (n) select(n, true); });
+ov.addEventListener('dblclick', e => {
+  const r = ov.getBoundingClientRect(); let n = hit(e.clientX - r.left, e.clientY - r.top);
+  while (n && n.p !== view) n = n.p;          // the child of the current view that contains the tile
+  if (n && isDir(n) && n.c.length) zoom(n);
+});
+addEventListener('keydown', e => { if (e.key === 'Escape' && view.p) zoom(view.p); });
+function zoom(n) { view = n; draw(); }
+
+// ---------- folder tree ----------
+let rowNodes = [];
+function renderTree() {
+  const out = []; rowNodes = [];
+  (function rows(n, depth) {
+    const i = rowNodes.push(n) - 1, open = expanded.has(n), dir = isDir(n) && n.c.length;
+    const parent = n.p ? n.p.s : n.s;
+    out.push(`<tr data-i="${i}" class="${n === sel ? 'sel' : ''}${n.e === '*' ? ' lump' : ''}">` +
+      `<td class="name" style="padding-left:${8 + depth*16}px"><span class="tog">${dir ? (open ? '▾' : '▸') : ''}</span>` +
+      `${isDir(n) ? '📁 ' : `<span class="sw" style="width:8px;background:${tileColor(n)}"></span> `}${esc(n.n)}</td>` +
+      `<td><div class="bar"><i style="width:${parent ? 100*n.s/parent : 0}%"></i></div></td>` +
+      `<td class="num">${pct(n.s, parent)}</td><td class="num">${fmt(n.s)}</td><td class="num">${n.f != null ? n.f.toLocaleString() : ''}</td></tr>`);
+    if (open && dir) for (const k of n.c) rows(k, depth + 1);
+  })(D.tree, 0);
+  $('#tree').innerHTML = out.join('');
+}
+$('#tree').addEventListener('click', e => {
+  const tr = e.target.closest('tr'); if (!tr) return; const n = rowNodes[+tr.dataset.i];
+  if (e.target.classList.contains('tog')) { expanded.has(n) ? expanded.delete(n) : expanded.add(n); renderTree(); return; }
+  select(n, false);
+});
+$('#tree').addEventListener('dblclick', e => {
+  const tr = e.target.closest('tr'); if (!tr) return; const n = rowNodes[+tr.dataset.i];
+  if (isDir(n) && n.c.length) { expanded.add(n); zoom(n); renderTree(); }
+});
+function select(n, fromMap) {
+  sel = n;
+  if (fromMap) for (let a = n.p; a; a = a.p) expanded.add(a);
+  if (!within(n, view)) { view = D.tree; draw(); } else drawOverlay();
+  renderTree();
+  const row = $('#tree tr.sel'); if (row && fromMap) row.scrollIntoView({ block: 'nearest' });
+  $('#status').textContent = `${pathOf(n)}  —  ${fmt(n.s)} (${pct(n.s, D.total)} of total)`;
+}
+
+// ---------- extensions ----------
+function renderExts() {
+  $('#exts').innerHTML = D.exts.map(([e, b, c], i) =>
+    `<tr data-i="${i}" class="${e === hiExt ? 'sel' : ''}"><td><span class="extname" title="${esc(e)}">${esc(e === '*' ? '(lumped small files)' : e)}</span></td>` +
+    `<td><span class="sw" style="background:${color[e]}"></span></td>` +
+    `<td class="num">${fmt(b)}</td><td class="num">${pct(b, D.total)}</td><td class="num">${c.toLocaleString()}</td></tr>`).join('');
+}
+$('#exts').addEventListener('click', e => {
+  const tr = e.target.closest('tr'); if (!tr) return; const ext = D.exts[+tr.dataset.i][0];
+  hiExt = hiExt === ext ? null : ext; renderExts(); draw();
+});
+
+renderTree(); renderExts();
+let raf = 0; new ResizeObserver(() => { cancelAnimationFrame(raf); raf = requestAnimationFrame(draw); }).observe($('#mapwrap'));
+</script></body></html>
